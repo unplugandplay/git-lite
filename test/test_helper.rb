@@ -49,6 +49,10 @@ module GitLite
       assert collection.empty?, msg || "Expected collection to be empty"
     end
 
+    def refute_empty(collection, msg = nil)
+      refute collection.empty?, msg || "Expected collection to not be empty"
+    end
+
     def assert_instance_of(klass, obj, msg = nil)
       assert obj.is_a?(klass), msg || "Expected #{obj.class} to be #{klass}"
     end
