@@ -1,42 +1,33 @@
-# Database layer for git-lite using SQLite
-
-require 'sqlite3'
-require 'zlib'
+# Database layer for git-lite using SQLite (mruby-compatible)
 
 module GitLite
   class DB
     SCHEMA_VERSION = 1
-    
+
     def initialize(db_path)
       @db_path = db_path
-      @db = nil
+      @wrapper = nil
     end
-    
+
     def connect
-      @db = SQLite3::Database.new(@db_path)
-      @db.busy_timeout = 5000
-      @db.results_as_hash = true
-      @db.type_translation = true
-      @db.execute("PRAGMA foreign_keys = ON")
-      @db.execute("PRAGMA journal_mode = WAL")
-      @db.execute("PRAGMA synchronous = NORMAL")
+      @wrapper = SQLiteWrapper.new(@db_path).connect
       self
     end
-    
+
     def close
-      @db&.close
-      @db = nil
+      @wrapper.close if @wrapper
+      @wrapper = nil
     end
-    
+
     def connected?
-      !@db.nil?
+      !@wrapper.nil?
     end
-    
+
     # Schema management
     def init_schema
       return if schema_exists?
-      
-      @db.transaction do
+
+      @wrapper.transaction do
         create_metadata_table
         create_commits_table
         create_paths_table
@@ -44,58 +35,55 @@ module GitLite
         create_content_table
         create_refs_table
         create_sync_state_table
-        ContentStore.create_schema(@db)
+        ContentStore.create_schema(@wrapper)
         set_schema_version(SCHEMA_VERSION)
       end
     end
-    
+
     def content_store
       @content_store ||= ContentStore.new(self)
     end
-    
+
     def schema_exists?
-      result = @db.execute(<<-SQL)
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='commits'
-      SQL
+      result = @wrapper.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='commits'")
       result.length > 0
     end
-    
+
     def get_schema_version
       return 0 unless schema_exists?
-      result = @db.get_first_value("SELECT value FROM metadata WHERE key = 'schema_version'")
+      result = @wrapper.get_first_value("SELECT value FROM metadata WHERE key = 'schema_version'")
       result ? result.to_i : 0
-    rescue SQLite3::Exception
+    rescue StandardError
       0
     end
-    
+
     def set_schema_version(version)
-      @db.execute(<<-SQL, ['schema_version', version.to_s])
-        INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)
-      SQL
+      @wrapper.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+        ['schema_version', version.to_s]
+      )
     end
-    
+
     def drop_schema
-      tables = %w[metadata sync_state refs file_refs content paths commits]
+      tables = ['metadata', 'sync_state', 'refs', 'file_refs', 'content', 'content_meta', 'paths', 'commits']
       tables.each do |table|
-        @db.execute("DROP TABLE IF EXISTS #{table}")
+        @wrapper.execute("DROP TABLE IF EXISTS #{table}")
       end
     end
-    
-    # Table creation
+
     private
-    
+
     def create_metadata_table
-      @db.execute(<<-SQL)
+      @wrapper.execute(<<-SQL)
         CREATE TABLE IF NOT EXISTS metadata (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         )
       SQL
     end
-    
+
     def create_commits_table
-      @db.execute(<<-SQL)
+      @wrapper.execute(<<-SQL)
         CREATE TABLE IF NOT EXISTS commits (
           id TEXT PRIMARY KEY,
           parent_id TEXT,
@@ -109,26 +97,24 @@ module GitLite
           committed_at TEXT NOT NULL
         )
       SQL
-      
-      @db.execute("CREATE INDEX IF NOT EXISTS idx_commits_parent ON commits(parent_id)")
-      @db.execute("CREATE INDEX IF NOT EXISTS idx_commits_authored ON commits(authored_at DESC)")
+      @wrapper.execute("CREATE INDEX IF NOT EXISTS idx_commits_parent ON commits(parent_id)")
+      @wrapper.execute("CREATE INDEX IF NOT EXISTS idx_commits_authored ON commits(authored_at DESC)")
     end
-    
+
     def create_paths_table
-      @db.execute(<<-SQL)
+      @wrapper.execute(<<-SQL)
         CREATE TABLE IF NOT EXISTS paths (
           path_id INTEGER PRIMARY KEY AUTOINCREMENT,
           group_id INTEGER NOT NULL,
           path TEXT NOT NULL UNIQUE
         )
       SQL
-      
-      @db.execute("CREATE INDEX IF NOT EXISTS idx_paths_path ON paths(path)")
-      @db.execute("CREATE INDEX IF NOT EXISTS idx_paths_group ON paths(group_id)")
+      @wrapper.execute("CREATE INDEX IF NOT EXISTS idx_paths_path ON paths(path)")
+      @wrapper.execute("CREATE INDEX IF NOT EXISTS idx_paths_group ON paths(group_id)")
     end
-    
+
     def create_file_refs_table
-      @db.execute(<<-SQL)
+      @wrapper.execute(<<-SQL)
         CREATE TABLE IF NOT EXISTS file_refs (
           path_id INTEGER NOT NULL,
           commit_id TEXT NOT NULL,
@@ -143,14 +129,12 @@ module GitLite
           FOREIGN KEY (commit_id) REFERENCES commits(id)
         )
       SQL
-      
-      @db.execute("CREATE INDEX IF NOT EXISTS idx_file_refs_commit ON file_refs(commit_id)")
-      @db.execute("CREATE INDEX IF NOT EXISTS idx_file_refs_version ON file_refs(path_id, version_id)")
+      @wrapper.execute("CREATE INDEX IF NOT EXISTS idx_file_refs_commit ON file_refs(commit_id)")
+      @wrapper.execute("CREATE INDEX IF NOT EXISTS idx_file_refs_version ON file_refs(path_id, version_id)")
     end
-    
+
     def create_content_table
-      # Stores file content keyed by (path_id, version_id)
-      @db.execute(<<-SQL)
+      @wrapper.execute(<<-SQL)
         CREATE TABLE IF NOT EXISTS content (
           path_id INTEGER NOT NULL,
           version_id INTEGER NOT NULL,
@@ -160,18 +144,18 @@ module GitLite
         )
       SQL
     end
-    
+
     def create_refs_table
-      @db.execute(<<-SQL)
+      @wrapper.execute(<<-SQL)
         CREATE TABLE IF NOT EXISTS refs (
           name TEXT PRIMARY KEY,
           commit_id TEXT NOT NULL
         )
       SQL
     end
-    
+
     def create_sync_state_table
-      @db.execute(<<-SQL)
+      @wrapper.execute(<<-SQL)
         CREATE TABLE IF NOT EXISTS sync_state (
           remote_name TEXT PRIMARY KEY,
           last_commit_id TEXT,
@@ -179,325 +163,253 @@ module GitLite
         )
       SQL
     end
-    
+
     public
-    
+
     # Commit operations
     def create_commit(commit)
-      @db.execute(<<-SQL,
-        INSERT INTO commits 
-        (id, parent_id, tree_hash, message, author_name, author_email, 
-         authored_at, committer_name, committer_email, committed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      SQL
+      @wrapper.execute(
+        "INSERT INTO commits (id, parent_id, tree_hash, message, author_name, author_email, authored_at, committer_name, committer_email, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           commit[:id], commit[:parent_id], commit[:tree_hash], commit[:message],
           commit[:author_name], commit[:author_email], commit[:authored_at].iso8601,
           commit[:committer_name], commit[:committer_email], commit[:committed_at].iso8601
-        ].flatten)
+        ]
+      )
     end
-    
+
     def create_commits_batch(commits)
       return if commits.empty?
-      
-      @db.transaction do
-        stmt = @db.prepare(<<-SQL)
-          INSERT INTO commits 
-          (id, parent_id, tree_hash, message, author_name, author_email, 
-           authored_at, committer_name, committer_email, committed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        SQL
-        
-        commits.each do |c|
-          stmt.execute([
-            c[:id], c[:parent_id], c[:tree_hash], c[:message],
-            c[:author_name], c[:author_email], c[:authored_at].iso8601,
-            c[:committer_name], c[:committer_email], c[:committed_at].iso8601
-          ])
-        end
-        stmt.close
+      @wrapper.transaction do
+        commits.each { |c| create_commit(c) }
       end
     end
-    
+
     def get_commit(id)
-      row = @db.get_first_row("SELECT * FROM commits WHERE id = ?", id)
+      row = @wrapper.get_first_row("SELECT * FROM commits WHERE id = ?", id)
       row ? hash_to_commit(row) : nil
     end
-    
+
     def get_head_commit
       head_id = get_head
       return nil unless head_id
       get_commit(head_id)
     end
-    
+
     def get_commit_log(limit = 50)
       head_id = get_head
       return [] unless head_id
-      
-      rows = @db.execute(<<-SQL, [head_id, limit])
-        SELECT * FROM commits 
-        WHERE id <= ?
-        ORDER BY id DESC
-        LIMIT ?
-      SQL
-      
+
+      rows = @wrapper.execute(
+        "SELECT * FROM commits WHERE id <= ? ORDER BY id DESC LIMIT ?",
+        [head_id, limit]
+      )
       rows.map { |r| hash_to_commit(r) }
     end
-    
+
     def commit_exists?(id)
-      result = @db.get_first_value("SELECT 1 FROM commits WHERE id = ?", id)
+      result = @wrapper.get_first_value("SELECT 1 FROM commits WHERE id = ?", id)
       !result.nil?
     end
-    
+
     def get_latest_commit_id
-      @db.get_first_value("SELECT id FROM commits ORDER BY id DESC LIMIT 1")
+      @wrapper.get_first_value("SELECT id FROM commits ORDER BY id DESC LIMIT 1")
     end
-    
+
     def count_commits
-      @db.get_first_value("SELECT COUNT(*) FROM commits").to_i
+      @wrapper.get_first_value("SELECT COUNT(*) FROM commits").to_i
     end
-    
+
     def delete_commits(commit_ids)
       return if commit_ids.empty?
-      
       placeholders = commit_ids.map { '?' }.join(',')
-      @db.execute("DELETE FROM commits WHERE id IN (#{placeholders})", commit_ids)
+      @wrapper.execute("DELETE FROM commits WHERE id IN (#{placeholders})", commit_ids)
     end
-    
+
     # Ref operations
     def get_ref(name)
-      row = @db.get_first_row("SELECT * FROM refs WHERE name = ?", name)
+      row = @wrapper.get_first_row("SELECT * FROM refs WHERE name = ?", name)
       row ? { name: row['name'], commit_id: row['commit_id'] } : nil
     end
-    
+
     def set_ref(name, commit_id)
-      @db.execute(<<-SQL, [name, commit_id])
-        INSERT OR REPLACE INTO refs (name, commit_id) VALUES (?, ?)
-      SQL
+      @wrapper.execute("INSERT OR REPLACE INTO refs (name, commit_id) VALUES (?, ?)", [name, commit_id])
     end
-    
+
     def delete_ref(name)
-      @db.execute("DELETE FROM refs WHERE name = ?", name)
+      @wrapper.execute("DELETE FROM refs WHERE name = ?", [name])
     end
-    
+
     def get_all_refs
-      rows = @db.execute("SELECT * FROM refs ORDER BY name")
+      rows = @wrapper.execute("SELECT * FROM refs ORDER BY name")
       rows.map { |r| { name: r['name'], commit_id: r['commit_id'] } }
     end
-    
+
     def get_head
       ref = get_ref('HEAD')
       ref ? ref[:commit_id] : nil
     end
-    
+
     def set_head(commit_id)
       set_ref('HEAD', commit_id)
     end
-    
+
     # Path operations
     def get_or_create_path(path, group_id = nil)
-      # Try to get existing
-      row = @db.get_first_row("SELECT path_id, group_id FROM paths WHERE path = ?", path)
+      row = @wrapper.get_first_row("SELECT path_id, group_id FROM paths WHERE path = ?", path)
       return [row['path_id'], row['group_id']] if row
-      
-      # Create new - if no group_id, use the next auto-increment as group_id
+
       if group_id.nil?
-        max_group = @db.get_first_value("SELECT COALESCE(MAX(group_id), 0) FROM paths")
+        max_group = @wrapper.get_first_value("SELECT COALESCE(MAX(group_id), 0) FROM paths")
         group_id = max_group.to_i + 1
       end
-      
-      @db.execute("INSERT INTO paths (group_id, path) VALUES (?, ?)", [group_id, path])
-      [@db.last_insert_row_id, group_id]
+
+      @wrapper.execute("INSERT INTO paths (group_id, path) VALUES (?, ?)", [group_id, path])
+      [@wrapper.last_insert_row_id, group_id]
     end
-    
+
     def get_path_id_and_group_id(path)
-      row = @db.get_first_row("SELECT path_id, group_id FROM paths WHERE path = ?", path)
+      row = @wrapper.get_first_row("SELECT path_id, group_id FROM paths WHERE path = ?", path)
       row ? [row['path_id'], row['group_id']] : [nil, nil]
     end
-    
+
     def get_path_by_id(path_id)
-      @db.get_first_value("SELECT path FROM paths WHERE path_id = ?", path_id)
+      @wrapper.get_first_value("SELECT path FROM paths WHERE path_id = ?", path_id)
     end
-    
+
     def get_all_paths
-      @db.execute("SELECT path FROM paths ORDER BY path").map { |r| r['path'] }
+      @wrapper.execute("SELECT path FROM paths ORDER BY path").map { |r| r['path'] }
     end
-    
+
     # File ref operations
     def create_file_ref(ref)
-      @db.execute(<<-SQL,
-        INSERT INTO file_refs 
-        (path_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      SQL
+      @wrapper.execute(
+        "INSERT INTO file_refs (path_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
           ref[:path_id], ref[:commit_id], ref[:version_id], ref[:content_hash],
           ref[:mode], ref[:is_symlink] ? 1 : 0, ref[:symlink_target],
           ref[:is_binary] ? 1 : 0
-        ].flatten)
+        ]
+      )
     end
-    
+
     def create_file_refs_batch(refs)
       return if refs.empty?
-      
-      @db.transaction do
-        stmt = @db.prepare(<<-SQL)
-          INSERT INTO file_refs 
-          (path_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        SQL
-        
-        refs.each do |r|
-          stmt.execute([
-            r[:path_id], r[:commit_id], r[:version_id], r[:content_hash],
-            r[:mode], r[:is_symlink] ? 1 : 0, r[:symlink_target],
-            r[:is_binary] ? 1 : 0
-          ])
-        end
-        stmt.close
+      @wrapper.transaction do
+        refs.each { |r| create_file_ref(r) }
       end
     end
-    
+
     def get_file_ref(path_id, commit_id)
-      row = @db.get_first_row(<<-SQL, [path_id, commit_id])
-        SELECT fr.*, p.path, p.group_id 
-        FROM file_refs fr
-        JOIN paths p ON p.path_id = fr.path_id
-        WHERE fr.path_id = ? AND fr.commit_id = ?
-      SQL
+      row = @wrapper.get_first_row(
+        "SELECT fr.path_id, fr.commit_id, fr.version_id, fr.content_hash, fr.mode, fr.is_symlink, fr.symlink_target, fr.is_binary, p.path, p.group_id FROM file_refs fr JOIN paths p ON p.path_id = fr.path_id WHERE fr.path_id = ? AND fr.commit_id = ?",
+        path_id, commit_id
+      )
       row ? hash_to_file_ref(row) : nil
     end
-    
+
     def get_file_refs_at_commit(commit_id)
-      rows = @db.execute(<<-SQL, commit_id)
-        SELECT fr.*, p.path, p.group_id 
-        FROM file_refs fr
-        JOIN paths p ON p.path_id = fr.path_id
-        WHERE fr.commit_id = ?
-        ORDER BY p.path
-      SQL
+      rows = @wrapper.execute(
+        "SELECT fr.path_id, fr.commit_id, fr.version_id, fr.content_hash, fr.mode, fr.is_symlink, fr.symlink_target, fr.is_binary, p.path, p.group_id FROM file_refs fr JOIN paths p ON p.path_id = fr.path_id WHERE fr.commit_id = ? ORDER BY p.path",
+        [commit_id]
+      )
       rows.map { |r| hash_to_file_ref(r) }
     end
-    
+
     def get_tree_at_commit(commit_id)
-      # Get the latest version of each file at or before this commit
-      rows = @db.execute(<<-SQL, commit_id)
-        SELECT fr.*, p.path, p.group_id 
-        FROM file_refs fr
-        JOIN paths p ON p.path_id = fr.path_id
-        WHERE fr.commit_id <= ?
-        AND fr.path_id IN (
-          SELECT path_id FROM file_refs 
-          WHERE commit_id <= ? 
-          GROUP BY path_id 
-          HAVING MAX(commit_id) = fr.commit_id
-        )
-        AND fr.content_hash IS NOT NULL
-        ORDER BY p.path
-      SQL
+      rows = @wrapper.execute(
+        "SELECT fr.path_id, fr.commit_id, fr.version_id, fr.content_hash, fr.mode, fr.is_symlink, fr.symlink_target, fr.is_binary, p.path, p.group_id FROM file_refs fr JOIN paths p ON p.path_id = fr.path_id WHERE fr.commit_id <= ? AND fr.path_id IN (SELECT path_id FROM file_refs WHERE commit_id <= ? GROUP BY path_id HAVING MAX(commit_id) = fr.commit_id) AND fr.content_hash IS NOT NULL ORDER BY p.path",
+        [commit_id, commit_id]
+      )
       rows.map { |r| hash_to_file_ref(r) }
     end
-    
+
     def get_next_version_id(group_id)
-      result = @db.get_first_value(<<-SQL, group_id)
-        SELECT COALESCE(MAX(fr.version_id), 0) + 1
-        FROM file_refs fr
-        JOIN paths p ON p.path_id = fr.path_id
-        WHERE p.group_id = ?
-      SQL
+      result = @wrapper.get_first_value(
+        "SELECT COALESCE(MAX(fr.version_id), 0) + 1 FROM file_refs fr JOIN paths p ON p.path_id = fr.path_id WHERE p.group_id = ?",
+        group_id
+      )
       result.to_i
     end
-    
+
     # Content operations with zlib compression
     def create_content(path_id, version_id, data)
       content = data.to_s
-      
-      # Compress if beneficial (content > 100 bytes)
+
       if content.bytesize > 100
         compressed = Zlib.deflate(content)
         if compressed.bytesize < content.bytesize * 0.9
-          # Use compressed - flag byte 0x03 = keyframe + compressed
           packed = [0x03].pack('C') + compressed
         else
-          # Compression not beneficial
           packed = [0x01].pack('C') + content
         end
       else
-        # Small content - don't compress
         packed = [0x01].pack('C') + content
       end
-      
-      @db.execute(<<-SQL, [path_id, version_id, SQLite3::Blob.new(packed)])
-        INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, ?)
-      SQL
-      
-      # Mark as keyframe in meta table
-      @db.execute(
+
+      @wrapper.execute(
+        "INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, ?)",
+        [path_id, version_id, packed]
+      )
+
+      @wrapper.execute(
         "INSERT OR REPLACE INTO content_meta (path_id, version_id, is_keyframe, base_version) VALUES (?, ?, 1, NULL)",
         [path_id, version_id]
       )
     end
-    
+
     def create_content_batch(contents)
       return if contents.empty?
-      
       contents.each do |c|
         create_content(c[:path_id], c[:version_id], c[:data])
       end
     end
-    
+
     def get_content(path_id, version_id)
-      # Check if this is a delta or keyframe
-      meta = @db.get_first_row(<<-SQL, [path_id, version_id])
-        SELECT is_keyframe, base_version FROM content_meta WHERE path_id = ? AND version_id = ?
-      SQL
-      
+      meta = @wrapper.get_first_row(
+        "SELECT is_keyframe, base_version FROM content_meta WHERE path_id = ? AND version_id = ?",
+        path_id, version_id
+      )
+
       return nil unless meta
-      
+
       data = get_content_raw(path_id, version_id)
       return nil if data.nil? || data.empty?
-      
-      # Unpack this version
-      flags = data[0].unpack('C')[0]
+
+      flags = data.getbyte(0)
       is_compressed = (flags & 0x02) != 0
       is_keyframe = (flags & 0x01) != 0
       content = data[1..-1]
-      
-      # Decompress if needed
+
       if is_compressed
         content = Zlib.inflate(content)
       end
-      
-      # If keyframe, return directly
+
       return content if is_keyframe || meta['is_keyframe'] == 1
-      
-      # This is a delta - need to get base content
+
       base_version = meta['base_version']
       if base_version
         base_content = get_content(path_id, base_version)
         return Delta.apply(base_content, content) if base_content
       end
-      
+
       content
-    rescue Zlib::Error
-      # Fallback for corrupt data
-      data[1..-1]
+    rescue => e
+      data ? data[1..-1] : nil
     end
-    
-    # Raw content access (packed with flags byte)
+
     def get_content_raw(path_id, version_id)
-      @db.get_first_value(
+      @wrapper.get_first_value(
         "SELECT data FROM content WHERE path_id = ? AND version_id = ?",
-        [path_id, version_id]
+        path_id, version_id
       )
     end
-    
-    # Blob operations (high-level)
+
+    # Blob operations
     def create_blob(blob)
       path_id, group_id = get_or_create_path(blob[:path])
       version_id = get_next_version_id(group_id)
-      
-      # Create file ref
+
       ref = {
         path_id: path_id,
         commit_id: blob[:commit_id],
@@ -509,24 +421,23 @@ module GitLite
         is_binary: blob[:is_binary] || false
       }
       create_file_ref(ref)
-      
-      # Create content (skip for deletions)
+
       if blob[:content_hash] && blob[:content]
         create_content(path_id, version_id, blob[:content])
       end
-      
+
       true
     end
-    
+
     def get_blob(path, commit_id)
       path_id, group_id = get_path_id_and_group_id(path)
       return nil unless path_id
-      
+
       ref = get_file_ref(path_id, commit_id)
       return nil unless ref
-      
+
       content = get_content(path_id, ref[:version_id]) if ref[:content_hash]
-      
+
       {
         path: path,
         commit_id: ref[:commit_id],
@@ -538,7 +449,7 @@ module GitLite
         is_binary: ref[:is_binary]
       }
     end
-    
+
     def get_blobs_at_commit(commit_id)
       refs = get_file_refs_at_commit(commit_id)
       refs.map do |ref|
@@ -555,7 +466,7 @@ module GitLite
         }
       end
     end
-    
+
     def get_tree(commit_id)
       refs = get_tree_at_commit(commit_id)
       refs.map do |ref|
@@ -572,65 +483,47 @@ module GitLite
         }
       end
     end
-    
+
     # Metadata operations
     def get_metadata(key)
-      @db.get_first_value("SELECT value FROM metadata WHERE key = ?", key)
+      @wrapper.get_first_value("SELECT value FROM metadata WHERE key = ?", key)
     end
-    
+
     def set_metadata(key, value)
-      @db.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-        [key, value]
-      )
+      @wrapper.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", [key, value])
     end
-    
+
     def get_repo_path
       get_metadata('repo_path')
     end
-    
+
     def set_repo_path(path)
       set_metadata('repo_path', path)
     end
-    
+
     # Stats
     def get_stats
-      base_stats = {
-        commits: @db.get_first_value("SELECT COUNT(*) FROM commits").to_i,
-        paths: @db.get_first_value("SELECT COUNT(*) FROM paths").to_i,
-        file_refs: @db.get_first_value("SELECT COUNT(*) FROM file_refs").to_i,
-        content_size: @db.get_first_value("SELECT COALESCE(SUM(LENGTH(data)), 0) FROM content").to_i
+      {
+        commits: @wrapper.get_first_value("SELECT COUNT(*) FROM commits").to_i,
+        paths: @wrapper.get_first_value("SELECT COUNT(*) FROM paths").to_i,
+        file_refs: @wrapper.get_first_value("SELECT COUNT(*) FROM file_refs").to_i,
+        content_size: @wrapper.get_first_value("SELECT COALESCE(SUM(LENGTH(data)), 0) FROM content").to_i
       }
-      
-      # Count compressed vs uncompressed
-      begin
-        compressed = @db.get_first_value("
-          SELECT COUNT(*) FROM content 
-          WHERE (CAST(SUBSTR(data, 1, 1) AS INTEGER) & 2) != 0
-        ").to_i
-        total = @db.get_first_value("SELECT COUNT(*) FROM content").to_i
-        base_stats[:compressed_versions] = compressed
-        base_stats[:uncompressed_versions] = total - compressed
-      rescue
-        # Ignore errors
-      end
-      
-      base_stats
     end
-    
+
     # Execute raw SQL
     def execute(sql, params = [])
-      @db.execute(sql, params)
+      @wrapper.execute(sql, params)
     end
-    
+
     # Find commit by prefix
     def find_commit_by_prefix(prefix)
-      row = @db.get_first_row("SELECT * FROM commits WHERE id LIKE ?", "#{prefix}%")
+      row = @wrapper.get_first_row("SELECT * FROM commits WHERE id LIKE ?", "#{prefix}%")
       row ? hash_to_commit(row) : nil
     end
-    
+
     private
-    
+
     def hash_to_commit(row)
       {
         id: row['id'],
@@ -645,7 +538,7 @@ module GitLite
         committed_at: Time.parse(row['committed_at'])
       }
     end
-    
+
     def hash_to_file_ref(row)
       {
         path_id: row['path_id'],
