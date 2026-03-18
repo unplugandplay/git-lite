@@ -1,81 +1,94 @@
-require 'rake/testtask'
+# Rakefile for git-lite (mruby build)
 
-Rake::TestTask.new do |t|
-  t.libs << 'lib' << 'test'
-  t.test_files = FileList['test/*_test.rb']
-  t.verbose = true
-  t.warning = false
+MRUBY_DIR = ENV['MRUBY_DIR'] || File.expand_path('~/mruby')
+
+desc "Build git-lite with mruby"
+task :build do
+  unless File.directory?(MRUBY_DIR)
+    puts "mruby not found at #{MRUBY_DIR}"
+    puts "Set MRUBY_DIR environment variable or install mruby"
+    exit 1
+  end
+
+  # Copy build_config.rb to mruby dir
+  cp 'build_config.rb', File.join(MRUBY_DIR, 'build_config.rb')
+
+  # Build mruby with our config
+  Dir.chdir(MRUBY_DIR) do
+    sh 'rake'
+  end
+
+  puts "Build complete!"
 end
 
-Rake::TestTask.new(:test_unit) do |t|
-  t.libs << 'lib' << 'test'
-  t.pattern = 'test/*_test.rb'
-  t.verbose = true
+desc "Run all tests with mruby"
+task :test do
+  test_files = Dir['test/*_test.rb'].sort
+  failures = 0
+
+  test_files.each do |f|
+    puts "\n=== #{File.basename(f)} ==="
+    unless system("mruby -I lib -I test #{f}")
+      failures += 1
+    end
+  end
+
+  puts "\n#{test_files.length} test files, #{failures} failures"
+  exit(1) if failures > 0
 end
 
-desc "Run all tests"
-task :test => :test_unit
-
-desc "Run tests with coverage"
-task :coverage do
-  ENV['COVERAGE'] = 'true'
-  Rake::Task[:test].invoke
-end
-
-desc "Run only unit tests (fast)"
+desc "Run unit tests only"
 task :fast do
-  tests = %w[util_test ui_test config_test db_test]
-  tests.each do |test|
-    system("ruby -Ilib:test test/#{test}")
+  tests = %w[util_test ui_test config_test db_test sqlite_wrapper_test]
+  tests.each do |t|
+    puts "\n=== #{t}.rb ==="
+    system("mruby -I lib -I test test/#{t}.rb")
   end
 end
 
-desc "Run integration tests (slower)"
+desc "Run integration tests"
 task :integration do
   tests = %w[integration_test git_importer_test edge_cases_test]
-  tests.each do |test|
-    system("ruby -Ilib:test test/#{test}")
+  tests.each do |t|
+    puts "\n=== #{t}.rb ==="
+    system("mruby -I lib -I test test/#{t}.rb")
   end
 end
 
-desc "Run performance tests"
-task :performance do
-  ENV['PERFORMANCE'] = 'true'
-  system("ruby -Ilib:test test/performance_test.rb")
+desc "Compile to standalone binary"
+task :compile do
+  Dir.mkdir('build') unless File.directory?('build')
+
+  # Concatenate all lib files into single source
+  sources = %w[
+    lib/git-lite/mruby_compat.rb
+    lib/git-lite/sqlite_wrapper.rb
+    lib/git-lite/util.rb
+    lib/git-lite/config.rb
+    lib/git-lite/db.rb
+    lib/git-lite/repo.rb
+    lib/git-lite/ui.rb
+    lib/git-lite/delta.rb
+    lib/git-lite/content_store.rb
+    lib/git-lite/git_importer.rb
+    lib/git-lite/cli.rb
+  ]
+
+  combined = sources.map { |f| File.read(f) }.join("\n")
+  combined += "\nGitLite::CLI.run(ARGV)\n"
+
+  File.write('build/git-lite-combined.rb', combined)
+
+  # Compile with mrbc
+  sh "mrbc -o build/git-lite.mrb build/git-lite-combined.rb"
+  puts "Compiled to build/git-lite.mrb"
 end
 
-desc "Build standalone mruby binary"
-task :build do
-  puts "Building git-lite..."
-  puts "Note: Requires mruby with sqlite3 gem compiled in"
-  
-  # This would compile with mruby
-  # mrbc -Bgit_lite lib/git-lite.rb
-end
-
-desc "Install locally"
-task :install do
-  target = File.expand_path('~/.local/bin')
-  Dir.mkdir(target) unless Dir.exist?(target)
-  
-  FileUtils.cp('bin/git-lite', File.join(target, 'git-lite'))
-  FileUtils.chmod(0755, File.join(target, 'git-lite'))
-  
-  puts "Installed to #{target}/git-lite"
-  puts "Make sure #{target} is in your PATH"
-end
-
-desc "Run linting"
+desc "Check syntax"
 task :lint do
-  system("ruby -c lib/git-lite.rb")
-  Dir['lib/git-lite/*.rb'].each do |file|
-    system("ruby -c #{file}")
+  Dir['lib/**/*.rb'].each do |f|
+    sh "mruby -c #{f}"
   end
-end
-
-desc "Generate documentation"
-task :docs do
-  system("rdoc lib/")
 end
 
 task default: :test

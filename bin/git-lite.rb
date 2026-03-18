@@ -1,6 +1,5 @@
-#!/usr/bin/env ruby
-# git-lite - Main entry point
-# Called by bin/git-lite wrapper
+#!/usr/bin/env mruby
+# git-lite - Main entry point (mruby)
 
 require 'git-lite'
 

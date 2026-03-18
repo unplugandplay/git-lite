@@ -1,13 +1,14 @@
 #!/bin/bash
 # git-lite - A Git-like version control system backed by SQLite
-# Wrapper script to handle gem environment issues
-
-# Use system Ruby and clear problematic environment variables
-unset GEM_HOME
-unset GEM_PATH
-unset RUBYOPT
-unset RUBYLIB
+# mruby version
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-exec /usr/bin/ruby -I "$SCRIPT_DIR/../lib" "$SCRIPT_DIR/git-lite.rb" "$@"
+# Try mruby first, fall back to system mruby
+if command -v mruby &> /dev/null; then
+    exec mruby -I "$SCRIPT_DIR/../lib" "$SCRIPT_DIR/git-lite.rb" "$@"
+else
+    echo "Error: mruby not found in PATH"
+    echo "Install mruby or add it to your PATH"
+    exit 1
+fi
