@@ -1,12 +1,12 @@
 # git-lite
 
-A Git-like version control system backed by SQLite.
+A Git-like version control system backed by SQLite, built with mruby.
 
-> This is a Ruby implementation of the pgit concept, replacing PostgreSQL with SQLite for a lightweight, portable solution.
+> Portable, single-binary VCS. No Ruby runtime required — compiles to mruby bitcode or a standalone native binary.
 
 ## Why git-lite?
 
-**No server required.** Unlike pgit which requires Docker/Podman and PostgreSQL, git-lite uses a single SQLite file for storage. Perfect for:
+**No server required.** Uses a single SQLite file for storage. Perfect for:
 
 - Personal projects
 - Embedded systems
@@ -20,16 +20,40 @@ A Git-like version control system backed by SQLite.
 - **Git import**: Import existing git repositories with full history
 - **Compression**: zlib compression + delta compression via `gc`
 - **SQL queryable**: Query your repository with SQL
-- **Zero dependencies**: Just Ruby and sqlite3
+- **mruby powered**: Compiles to bitcode (`.mrb`) or standalone binary — no CRuby needed
+
+## Requirements
+
+**Runtime (bitcode):**
+- mruby 3.4+ with required gems (see `build_config.rb`)
+
+**Build (standalone binary):**
+- mruby 3.4+ source with: mruby-sqlite3, mruby-zlib, mruby-json, mruby-sha2, mruby-io, mruby-dir, mruby-dir-glob, mruby-env, mruby-errno, mruby-pack, mruby-time-strftime, mruby-stringio
 
 ## Installation
 
-Requires:
-- Ruby 2.6+ with sqlite3 gem
+### Option 1: Run from bitcode
+
+```bash
+# Pre-compiled bitcode in release/bitcode/
+mruby release/bitcode/git-lite.mrb --version
+```
+
+### Option 2: Run from source
 
 ```bash
 chmod +x bin/git-lite
-./bin/git-lite --version
+mruby -I lib bin/git-lite.rb --version
+```
+
+### Option 3: Compile standalone binary
+
+```bash
+# Set mruby source directory
+export MRUBY_DIR=~/mruby
+
+# Build (copies build_config.rb and compiles)
+rake build
 ```
 
 ## Quick Start
@@ -81,6 +105,25 @@ git-lite gc
 | `sql <query>` | Run SQL queries |
 | `config <key> [value]` | Get/set configuration |
 | `version` | Show version |
+
+## Build & Test
+
+```bash
+# Run all tests
+rake test
+
+# Run unit tests only
+rake fast
+
+# Run integration tests
+rake integration
+
+# Syntax check all lib files
+rake lint
+
+# Compile to bitcode
+rake compile
+```
 
 ## Compression
 
@@ -162,6 +205,18 @@ git-lite sql "SELECT p.path, c.data FROM content c JOIN paths p ON c.path_id = p
 - `key` (TEXT PRIMARY KEY)
 - `value` (TEXT)
 
+## mruby Compatibility Notes
+
+This branch targets **mruby 3.4+** instead of CRuby. Key differences:
+
+- No `require 'fileutils'`, `'json'`, `'digest'`, etc. — all provided by mruby gems or compatibility shims
+- `mruby-sqlite3` (mattn) has a simpler API than the CRuby sqlite3 gem — wrapped via `SQLiteWrapper`
+- JSON uses string keys (no `symbolize_names:`)
+- Strings are byte strings — no `Encoding`, `force_encoding`, or `encode`
+- `Dir.glob` replaced with recursive directory traversal
+- `SecureRandom`, `FileUtils`, `Time.parse` provided by `mruby_compat.rb`
+- Tests use `mruby-mtest` instead of Minitest
+
 ## Benchmarks
 
 Importing [fzf](https://github.com/junegunn/fzf) (3,555 commits, 161 paths):
@@ -169,31 +224,12 @@ Importing [fzf](https://github.com/junegunn/fzf) (3,555 commits, 161 paths):
 | Metric | git `gc --aggressive` | git-lite (import + gc) |
 |--------|----------------------|------------------------|
 | Size | 4.2 MB | 21 MB |
-| Ratio | 1× | 5.0× |
+| Ratio | 1x | 5.0x |
 
 Compression stages:
 - Raw import: 112 MB
-- After zlib: 33 MB (3.4× reduction)
-- After delta GC: 21 MB (1.5× additional reduction)
-
-## Comparison with pgit
-
-| Feature | pgit | git-lite |
-|---------|------|----------|
-| Database | PostgreSQL + pg-xpatch | SQLite |
-| Container | Docker/Podman required | None |
-| Compression | Delta compression | zlib + delta |
-| Remote push/pull | Full support | File-based only |
-| Import from git | Yes | Yes |
-| SQL queries | Yes | Yes |
-| Size | Larger footprint | Single file |
-
-## Differences from pgit
-
-1. **Simpler compression**: zlib + delta instead of pg-xpatch
-2. **No container required**: Direct SQLite file access
-3. **No network remotes**: Copy `.git-lite/repo.db` directly
-4. **Simplified schema**: Removed xpatch-specific tables
+- After zlib: 33 MB (3.4x reduction)
+- After delta GC: 21 MB (1.5x additional reduction)
 
 ## License
 
