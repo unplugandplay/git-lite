@@ -1,0 +1,10 @@
+#!/usr/bin/env mruby
+
+# git-lite - A Git-like version control system backed by SQLite
+# This is the mruby implementation of pgit (PostgreSQL version)
+
+$LOAD_PATH.unshift File.expand_path('../lib', __dir__)
+
+require 'git-lite'
+
+GitLite::CLI.run(ARGV)
