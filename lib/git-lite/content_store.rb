@@ -15,7 +15,7 @@ module GitLite
       
       if is_keyframe || content.nil? || content.empty?
         # Store full content (keyframe)
-        @db.create_content(path_id, version_id, pack_content(content, true))
+        @db.create_content_raw(path_id, version_id, pack_content(content, true))
         @db.execute(
           "INSERT OR REPLACE INTO content_meta (path_id, version_id, is_keyframe, base_version) VALUES (?, ?, 1, NULL)",
           [path_id, version_id]
@@ -30,14 +30,14 @@ module GitLite
           
           if delta && delta.bytesize < content.bytesize * 0.8
             # Delta is beneficial
-            @db.create_content(path_id, version_id, pack_content(delta, false))
+            @db.create_content_raw(path_id, version_id, pack_content(delta, false))
             @db.execute(
               "INSERT OR REPLACE INTO content_meta (path_id, version_id, is_keyframe, base_version) VALUES (?, ?, 0, ?)",
               [path_id, version_id, base_version]
             )
           else
             # Store as keyframe instead
-            @db.create_content(path_id, version_id, pack_content(content, true))
+            @db.create_content_raw(path_id, version_id, pack_content(content, true))
             @db.execute(
               "INSERT OR REPLACE INTO content_meta (path_id, version_id, is_keyframe, base_version) VALUES (?, ?, 1, NULL)",
               [path_id, version_id]
@@ -45,7 +45,7 @@ module GitLite
           end
         else
           # No base, store full
-          @db.create_content(path_id, version_id, pack_content(content, true))
+          @db.create_content_raw(path_id, version_id, pack_content(content, true))
           @db.execute(
             "INSERT OR REPLACE INTO content_meta (path_id, version_id, is_keyframe, base_version) VALUES (?, ?, 1, NULL)",
             [path_id, version_id]

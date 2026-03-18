@@ -22,6 +22,7 @@ module GitLite
       'remote'    => 'Manage remotes',
       'config'    => 'Get and set repository options',
       'stats'     => 'Show repository statistics',
+      'gc'        => 'Run garbage collection (delta compression)',
       'sql'       => 'Run SQL queries on repository',
       'clean'     => 'Remove untracked files',
       'version'   => 'Show version',
@@ -75,6 +76,8 @@ module GitLite
         run_config(args)
       when 'stats'
         run_stats(args)
+      when 'gc'
+        run_gc(args)
       when 'sql'
         run_sql(args)
       when 'clean'
@@ -491,6 +494,114 @@ module GitLite
       rescue => e
         puts "SQL Error: #{e.message}"
       end
+    end
+    
+    def self.run_gc(args)
+      repo = Repo.open
+      aggressive = args.include?('--aggressive')
+      
+      puts "Running garbage collection with delta compression..."
+      
+      # Get all paths with their versions
+      paths = repo.db.execute(<<-SQL)
+        SELECT DISTINCT path_id FROM content_meta ORDER BY path_id
+      SQL
+      
+      total_paths = paths.length
+      processed = 0
+      deltas_created = 0
+      bytes_saved = 0
+      
+      paths.each do |row|
+        path_id = row['path_id']
+        
+        # Get all versions for this path with their data
+        versions = repo.db.execute(<<-SQL, path_id)
+          SELECT cm.version_id, c.data
+          FROM content_meta cm
+          JOIN content c ON c.path_id = cm.path_id AND c.version_id = cm.version_id
+          WHERE cm.path_id = ?
+          ORDER BY cm.version_id
+        SQL
+        
+        next if versions.length < 2
+        
+        last_keyframe_content = nil
+        last_keyframe_version = nil
+        
+        versions.each_with_index do |v, idx|
+          version_id = v['version_id']
+          data = v['data']
+          
+          # Unpack the content
+          flags = data[0].unpack('C')[0]
+          is_compressed = (flags & 0x02) != 0
+          raw_content = data[1..-1]
+          
+          if is_compressed
+            begin
+              raw_content = Zlib.inflate(raw_content)
+            rescue Zlib::Error
+              # Keep as-is if decompression fails
+            end
+          end
+          
+          # First version or every Nth is a keyframe
+          should_be_keyframe = (idx == 0) || (version_id % 100 == 0)
+          
+          if should_be_keyframe
+            last_keyframe_content = raw_content
+            last_keyframe_version = version_id
+            
+            repo.db.execute(
+              "UPDATE content_meta SET is_keyframe = 1, base_version = NULL WHERE path_id = ? AND version_id = ?",
+              [path_id, version_id]
+            ) unless idx == 0  # First is already keyframe
+          elsif last_keyframe_content && raw_content.length > 100
+            # Try delta compression for larger files
+            delta = Delta.create(last_keyframe_content, raw_content)
+            
+            if delta && delta.bytesize < raw_content.bytesize * 0.75
+              # Store delta - recompress if beneficial
+              final_data = delta
+              final_flags = 0x00  # Not keyframe, not compressed
+              
+              if delta.bytesize > 100
+                compressed = Zlib.deflate(delta)
+                if compressed.bytesize < delta.bytesize * 0.9
+                  final_data = compressed
+                  final_flags = 0x02  # Compressed
+                end
+              end
+              
+              packed = [final_flags].pack('C') + final_data
+              
+              repo.db.execute(
+                "UPDATE content SET data = ? WHERE path_id = ? AND version_id = ?",
+                [SQLite3::Blob.new(packed), path_id, version_id]
+              )
+              
+              repo.db.execute(
+                "UPDATE content_meta SET is_keyframe = 0, base_version = ? WHERE path_id = ? AND version_id = ?",
+                [last_keyframe_version, path_id, version_id]
+              )
+              
+              deltas_created += 1
+              bytes_saved += (raw_content.bytesize - packed.bytesize)
+            end
+          end
+        end
+        
+        processed += 1
+        puts "  Processed #{processed}/#{total_paths} paths (#{deltas_created} deltas)" if processed % 20 == 0
+      end
+      
+      puts "  Processed #{processed}/#{total_paths} paths (#{deltas_created} deltas)"
+      puts "Vacuuming database..."
+      repo.db.execute("VACUUM")
+      
+      puts ""
+      puts "GC complete: #{deltas_created} deltas created, #{Util.format_bytes(bytes_saved)} saved"
     end
     
     def self.run_clean(args)

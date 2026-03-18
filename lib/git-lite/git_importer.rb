@@ -18,12 +18,15 @@ module GitLite
       # Run git fast-export
       cmd = ['git', 'fast-export', '--reencode=yes', '--show-original-ids', branch]
       
-      stdout, stderr, status = Open3.capture3(*cmd, chdir: @git_path)
+      stdout, stderr, status = Open3.capture3(*cmd, chdir: @git_path, binmode: true)
       
       unless status.success?
         puts "Error: #{stderr}"
         raise "Failed to export git history"
       end
+      
+      # Force binary encoding for parsing
+      stdout.force_encoding(Encoding::ASCII_8BIT)
       
       # Parse the export
       parse_fast_export(stdout)
@@ -94,12 +97,16 @@ module GitLite
           size = line.chomp.sub('data ', '').to_i
           index += 1
           
-          # Read data
-          blob[:data] = lines[index..index].join[0...size]
-          index += 1
-          
-          # Skip trailing newline if present
-          index += 1 if lines[index] == "\n"
+          # Read data - accumulate lines until we have enough bytes
+          data_parts = []
+          bytes_read = 0
+          while bytes_read < size && index < lines.length
+            line_data = lines[index]
+            data_parts << line_data
+            bytes_read += line_data.length
+            index += 1
+          end
+          blob[:data] = data_parts.join[0...size]
           
           blob[:next_index] = index
           return blob
@@ -229,6 +236,9 @@ module GitLite
     end
     
     def import_commit(commit_data, blobs)
+      # Initialize commit map
+      @commit_map ||= {}
+      
       # Generate commit ID
       timestamp = commit_data[:committer_time] || Time.now
       time_part = timestamp.to_i.to_s(36).rjust(8, '0')
@@ -238,11 +248,29 @@ module GitLite
       # Map parent
       parent_id = nil
       if commit_data[:from]
-        parent_id = @commit_map[commit_data[:from]] if @commit_map
+        parent_id = @commit_map[commit_data[:from]]
       end
       
-      @commit_map ||= {}
       @commit_map[commit_data[:mark]] = commit_id if commit_data[:mark]
+      
+      # Create the commit FIRST (before file_refs due to FK constraint)
+      # Ensure message is valid UTF-8
+      message = commit_data[:message].to_s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '?').chomp
+      
+      commit = {
+        id: commit_id,
+        parent_id: parent_id,
+        tree_hash: Digest::SHA256.hexdigest(commit_data[:file_ops].map { |o| o[:path] }.sort.join),
+        message: message,
+        author_name: commit_data[:author_name],
+        author_email: commit_data[:author_email],
+        authored_at: commit_data[:author_time] || timestamp,
+        committer_name: commit_data[:committer_name],
+        committer_email: commit_data[:committer_email],
+        committed_at: timestamp
+      }
+      
+      @repo.db.create_commit(commit)
       
       # Process file operations
       commit_data[:file_ops].each do |op|
@@ -261,7 +289,8 @@ module GitLite
           blob_data = blobs[op[:mark]]
           
           if blob_data && blob_data[:data]
-            content = blob_data[:data]
+            # Ensure content is treated as binary
+            content = blob_data[:data].force_encoding(Encoding::ASCII_8BIT)
             
             @repo.db.create_blob({
               path: op[:path],
@@ -276,22 +305,6 @@ module GitLite
           end
         end
       end
-      
-      # Create the commit
-      commit = {
-        id: commit_id,
-        parent_id: parent_id,
-        tree_hash: Digest::SHA256.hexdigest(commit_data[:file_ops].map { |o| o[:path] }.sort.join),
-        message: commit_data[:message].chomp,
-        author_name: commit_data[:author_name],
-        author_email: commit_data[:author_email],
-        authored_at: commit_data[:author_time] || timestamp,
-        committer_name: commit_data[:committer_name],
-        committer_email: commit_data[:committer_email],
-        committed_at: timestamp
-      }
-      
-      @repo.db.create_commit(commit)
       
       # Update HEAD
       @repo.db.set_head(commit_id)

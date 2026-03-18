@@ -1,6 +1,7 @@
 # Database layer for git-lite using SQLite
 
 require 'sqlite3'
+require 'zlib'
 
 module GitLite
   class DB
@@ -183,16 +184,17 @@ module GitLite
     
     # Commit operations
     def create_commit(commit)
-      @db.execute(<<-SQL, [
-        commit[:id], commit[:parent_id], commit[:tree_hash], commit[:message],
-        commit[:author_name], commit[:author_email], commit[:authored_at].iso8601,
-        commit[:committer_name], commit[:committer_email], commit[:committed_at].iso8601
-      ])
+      @db.execute(<<-SQL,
         INSERT INTO commits 
         (id, parent_id, tree_hash, message, author_name, author_email, 
          authored_at, committer_name, committer_email, committed_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       SQL
+        [
+          commit[:id], commit[:parent_id], commit[:tree_hash], commit[:message],
+          commit[:author_name], commit[:author_email], commit[:authored_at].iso8601,
+          commit[:committer_name], commit[:committer_email], commit[:committed_at].iso8601
+        ].flatten)
     end
     
     def create_commits_batch(commits)
@@ -323,15 +325,16 @@ module GitLite
     
     # File ref operations
     def create_file_ref(ref)
-      @db.execute(<<-SQL, [
-        ref[:path_id], ref[:commit_id], ref[:version_id], ref[:content_hash],
-        ref[:mode], ref[:is_symlink] ? 1 : 0, ref[:symlink_target],
-        ref[:is_binary] ? 1 : 0
-      ])
+      @db.execute(<<-SQL,
         INSERT INTO file_refs 
         (path_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       SQL
+        [
+          ref[:path_id], ref[:commit_id], ref[:version_id], ref[:content_hash],
+          ref[:mode], ref[:is_symlink] ? 1 : 0, ref[:symlink_target],
+          ref[:is_binary] ? 1 : 0
+        ].flatten)
     end
     
     def create_file_refs_batch(refs)
@@ -405,26 +408,83 @@ module GitLite
       result.to_i
     end
     
-    # Content operations (with delta compression)
+    # Content operations with zlib compression
     def create_content(path_id, version_id, data)
-      @db.execute(<<-SQL, [path_id, version_id, SQLite3::Blob.new(data)])
+      content = data.to_s
+      
+      # Compress if beneficial (content > 100 bytes)
+      if content.bytesize > 100
+        compressed = Zlib.deflate(content)
+        if compressed.bytesize < content.bytesize * 0.9
+          # Use compressed - flag byte 0x03 = keyframe + compressed
+          packed = [0x03].pack('C') + compressed
+        else
+          # Compression not beneficial
+          packed = [0x01].pack('C') + content
+        end
+      else
+        # Small content - don't compress
+        packed = [0x01].pack('C') + content
+      end
+      
+      @db.execute(<<-SQL, [path_id, version_id, SQLite3::Blob.new(packed)])
         INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, ?)
       SQL
+      
+      # Mark as keyframe in meta table
+      @db.execute(
+        "INSERT OR REPLACE INTO content_meta (path_id, version_id, is_keyframe, base_version) VALUES (?, ?, 1, NULL)",
+        [path_id, version_id]
+      )
     end
     
     def create_content_batch(contents)
       return if contents.empty?
       
       contents.each do |c|
-        content_store.store(c[:path_id], c[:version_id], c[:data])
+        create_content(c[:path_id], c[:version_id], c[:data])
       end
     end
     
     def get_content(path_id, version_id)
-      content_store.retrieve(path_id, version_id)
+      # Check if this is a delta or keyframe
+      meta = @db.get_first_row(<<-SQL, [path_id, version_id])
+        SELECT is_keyframe, base_version FROM content_meta WHERE path_id = ? AND version_id = ?
+      SQL
+      
+      return nil unless meta
+      
+      data = get_content_raw(path_id, version_id)
+      return nil if data.nil? || data.empty?
+      
+      # Unpack this version
+      flags = data[0].unpack('C')[0]
+      is_compressed = (flags & 0x02) != 0
+      is_keyframe = (flags & 0x01) != 0
+      content = data[1..-1]
+      
+      # Decompress if needed
+      if is_compressed
+        content = Zlib.inflate(content)
+      end
+      
+      # If keyframe, return directly
+      return content if is_keyframe || meta['is_keyframe'] == 1
+      
+      # This is a delta - need to get base content
+      base_version = meta['base_version']
+      if base_version
+        base_content = get_content(path_id, base_version)
+        return Delta.apply(base_content, content) if base_content
+      end
+      
+      content
+    rescue Zlib::Error
+      # Fallback for corrupt data
+      data[1..-1]
     end
     
-    # Raw content access (for delta internal use)
+    # Raw content access (packed with flags byte)
     def get_content_raw(path_id, version_id)
       @db.get_first_value(
         "SELECT data FROM content WHERE path_id = ? AND version_id = ?",
@@ -542,24 +602,25 @@ module GitLite
         content_size: @db.get_first_value("SELECT COALESCE(SUM(LENGTH(data)), 0) FROM content").to_i
       }
       
-      # Add content store stats
+      # Count compressed vs uncompressed
       begin
-        content_stats = content_store.stats
-        base_stats.merge!(
-          content_versions: content_stats[:versions],
-          content_keyframes: content_stats[:keyframes],
-          content_deltas: content_stats[:deltas]
-        )
+        compressed = @db.get_first_value("
+          SELECT COUNT(*) FROM content 
+          WHERE (CAST(SUBSTR(data, 1, 1) AS INTEGER) & 2) != 0
+        ").to_i
+        total = @db.get_first_value("SELECT COUNT(*) FROM content").to_i
+        base_stats[:compressed_versions] = compressed
+        base_stats[:uncompressed_versions] = total - compressed
       rescue
-        # content_meta table might not exist yet
+        # Ignore errors
       end
       
       base_stats
     end
     
     # Execute raw SQL
-    def execute(sql)
-      @db.execute(sql)
+    def execute(sql, params = [])
+      @db.execute(sql, params)
     end
     
     # Find commit by prefix

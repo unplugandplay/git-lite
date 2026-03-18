@@ -1,167 +1,206 @@
 # Delta compression for git-lite
-# Implements a simple delta format similar to Fossil/git
+# Simple and fast delta format
 
 module GitLite
   module Delta
-    # Maximum size for inline content (store full if smaller)
-    INLINE_THRESHOLD = 100
+    BLOCK_SIZE = 16  # Bytes per hash block
     
-    # Create a delta from old_data to new_data
-    # Returns delta bytes that can reconstruct new_data from old_data
+    # Create delta - returns nil if not beneficial
     def self.create(old_data, new_data)
-      return new_data if old_data.nil? || old_data.empty?
-      return new_data if new_data.bytesize < INLINE_THRESHOLD
+      return nil if old_data.nil? || old_data.empty?
+      return nil if new_data.bytesize < 200  # Only delta compress larger files
+      return nil if old_data == new_data
       
-      # Simple delta format:
-      # [1 byte: version][4 bytes: output length]
-      # Commands:
-      #   0x01 + 4-byte offset + 2-byte length = copy from source
-      #   0x02 + 2-byte length + data = insert new bytes
+      # Quick check: if files are very different, skip delta
+      similarity = quick_similarity(old_data, new_data)
+      return nil if similarity < 0.3  # Less than 30% similar
       
-      commands = []
-      output_len = new_data.bytesize
-      
-      # Find matching chunks using rolling hash
-      pos = 0
-      while pos < new_data.bytesize
-        match = find_best_match(old_data, new_data, pos)
-        
-        if match && match[:length] > 8
-          # Copy from source: offset, length
-          commands << [:copy, match[:offset], match[:length]]
-          pos += match[:length]
-        else
-          # Insert new bytes: find next match or end
-          insert_len = [64, new_data.bytesize - pos].min
-          if match
-            insert_len = [insert_len, match[:start] - pos].min
-          end
-          insert_len = new_data.bytesize - pos if pos + insert_len >= new_data.bytesize
-          
-          commands << [:insert, new_data.byteslice(pos, insert_len)]
-          pos += insert_len
-        end
+      # Build hash table of old_data blocks
+      block_hashes = {}
+      (0..old_data.bytesize - BLOCK_SIZE).step(BLOCK_SIZE) do |i|
+        hash = hash_block(old_data, i)
+        block_hashes[hash] ||= []
+        block_hashes[hash] << i
       end
       
-      encode_delta(commands, output_len)
+      # Find matches in new_data
+      matches = []
+      pos = 0
+      
+      while pos <= new_data.bytesize - BLOCK_SIZE
+        hash = hash_block(new_data, pos)
+        
+        if block_hashes[hash]
+          # Found potential match, extend it
+          best_len = BLOCK_SIZE
+          best_offset = block_hashes[hash].first
+          
+          block_hashes[hash].each do |offset|
+            len = extend_match(old_data, new_data, offset, pos)
+            if len > best_len
+              best_len = len
+              best_offset = offset
+            end
+          end
+          
+          if best_len >= BLOCK_SIZE
+            matches << [pos, best_offset, best_len]
+            pos += best_len
+            next
+          end
+        end
+        
+        pos += 1
+      end
+      
+      # If not enough matches, don't use delta
+      total_matched = matches.sum { |m| m[2] }
+      return nil if total_matched < new_data.bytesize * 0.2
+      
+      # Build delta from matches
+      build_delta(old_data.bytesize, new_data, matches)
     end
     
-    # Apply delta to base data to reconstruct target
+    # Apply delta to reconstruct target
     def self.apply(base_data, delta)
-      # Check if delta is actually compressed data (no delta)
-      return delta if delta.bytesize < 5
+      return delta if delta.bytesize < 9
       
-      version, output_len = decode_header(delta)
-      return delta if version == 0  # Uncompressed
+      # Check magic
+      magic, version = delta[0..1].unpack('CC')
+      return delta unless magic == 0xD5 && version == 1
       
-      result = String.new(encoding: Encoding::BINARY)
-      pos = 5  # Skip header
+      base_size, output_size = delta[2..9].unpack('NN')
       
-      while pos < delta.bytesize && result.bytesize < output_len
+      result = String.new(encoding: Encoding::BINARY, capacity: output_size)
+      pos = 10
+      
+      while pos < delta.bytesize && result.bytesize < output_size
         cmd = delta.getbyte(pos)
         pos += 1
         
         case cmd
-        when 0x01  # Copy
-          offset = delta.byteslice(pos, 4).unpack1('N')
-          pos += 4
-          length = delta.byteslice(pos, 2).unpack1('n')
-          pos += 2
+        when 0x01  # Copy from base
+          offset, length = delta[pos..pos+7].unpack('NN')
+          pos += 8
           result << base_data.byteslice(offset, length)
-        when 0x02  # Insert
-          length = delta.byteslice(pos, 2).unpack1('n')
-          pos += 2
-          result << delta.byteslice(pos, length)
+        when 0x02  # Insert literal
+          length = delta[pos..pos+3].unpack1('N')
+          pos += 4
+          result << delta[pos, length]
           pos += length
         else
-          # Unknown command, treat as uncompressed
-          return delta
+          # Invalid command
+          return nil
         end
       end
       
       result
     end
     
-    # Compress using zstd (simpler alternative to delta)
-    def self.compress(data)
-      require 'zstd-ruby' rescue return data
-      Zstd.compress(data)
-    end
-    
-    def self.decompress(data)
-      require 'zstd-ruby' rescue return data
-      Zstd.decompress(data)
-    rescue
-      data
-    end
-    
     private
     
-    def self.find_best_match(old_data, new_data, start_pos)
-      return nil if old_data.nil? || old_data.empty?
+    def self.quick_similarity(old_data, new_data)
+      # Sample-based similarity check
+      samples = 10
+      sample_size = 16
+      matches = 0
       
-      # Simple hash-based matching
-      best = nil
-      best_score = 0
+      return 0 if new_data.bytesize < sample_size
       
-      # Try exact match of first 8 bytes at start_pos
-      chunk = new_data.byteslice(start_pos, 8)
-      return nil if chunk.nil? || chunk.bytesize < 4
-      
-      # Find all occurrences in old_data
-      offset = 0
-      while (found = old_data.index(chunk, offset))
-        # Extend match
-        length = chunk.bytesize
-        while start_pos + length < new_data.bytesize &&
-              found + length < old_data.bytesize &&
-              new_data.getbyte(start_pos + length) == old_data.getbyte(found + length)
-          length += 1
-        end
-        
-        if length > best_score
-          best_score = length
-          best = { offset: found, length: length, start: start_pos }
-        end
-        
-        offset = found + 1
+      samples.times do
+        pos = rand(0..new_data.bytesize - sample_size)
+        sample = new_data.byteslice(pos, sample_size)
+        matches += 1 if old_data.include?(sample)
       end
       
-      best
+      matches.to_f / samples
     end
     
-    def self.encode_delta(commands, output_len)
-      result = String.new(encoding: Encoding::BINARY)
+    def self.hash_block(data, offset)
+      # Simple rolling hash
+      hash = 0
+      len = [BLOCK_SIZE, data.bytesize - offset].min
+      len.times do |i|
+        hash = ((hash << 5) - hash + data.getbyte(offset + i)) & 0xFFFFFFFF
+      end
+      hash
+    end
+    
+    def self.extend_match(old_data, new_data, old_pos, new_pos)
+      # Extend match backward
+      start_old = old_pos
+      start_new = new_pos
       
-      # Header: version 1 + 4-byte output length
-      result << 0x01.chr
-      result << [output_len].pack('N')
+      while start_old > 0 && start_new > 0 && 
+            old_data.getbyte(start_old - 1) == new_data.getbyte(start_new - 1)
+        start_old -= 1
+        start_new -= 1
+      end
       
-      commands.each do |cmd|
-        case cmd[0]
-        when :copy
-          result << 0x01.chr
-          result << [cmd[1]].pack('N')  # offset
-          result << [cmd[2]].pack('n')  # length
-        when :insert
-          data = cmd[1]
-          result << 0x02.chr
-          result << [data.bytesize].pack('n')
-          result << data
+      # Extend match forward
+      len = 0
+      max_len = [old_data.bytesize - old_pos, new_data.bytesize - new_pos].min
+      while len < max_len && old_data.getbyte(old_pos + len) == new_data.getbyte(new_pos + len)
+        len += 1
+      end
+      
+      # Add backward extension
+      len += (old_pos - start_old)
+      
+      len
+    end
+    
+    def self.build_delta(base_size, new_data, matches)
+      # Sort matches by position in new_data
+      matches.sort_by! { |m| m[0] }
+      
+      # Merge overlapping/adjacent matches
+      merged = []
+      matches.each do |match|
+        if merged.empty? || match[0] > merged.last[0] + merged.last[2]
+          merged << match
+        else
+          # Extend current match if beneficial
+          old_end = merged.last[0] + merged.last[2]
+          if match[0] + match[2] > old_end
+            merged.last[2] = match[0] + match[2] - merged.last[0]
+          end
         end
       end
       
-      # Only use delta if it's smaller
-      result.bytesize < output_len ? result : nil
-    end
-    
-    def self.decode_header(delta)
-      return [0, 0] if delta.bytesize < 5
+      # Build delta: [magic][version][base_size][output_size][commands...]
+      delta = String.new(encoding: Encoding::BINARY)
+      delta << 0xD5.chr  # Magic
+      delta << 0x01.chr  # Version
+      delta << [base_size, new_data.bytesize].pack('NN')
       
-      version = delta.getbyte(0)
-      output_len = delta.byteslice(1, 4).unpack1('N')
+      pos = 0
+      merged.each do |new_pos, old_pos, length|
+        # Insert literal before match if needed
+        if new_pos > pos
+          literal = new_data.byteslice(pos, new_pos - pos)
+          delta << 0x02.chr
+          delta << [literal.bytesize].pack('N')
+          delta << literal
+        end
+        
+        # Copy from base
+        delta << 0x01.chr
+        delta << [old_pos, length].pack('NN')
+        
+        pos = new_pos + length
+      end
       
-      [version, output_len]
+      # Final literal
+      if pos < new_data.bytesize
+        literal = new_data.byteslice(pos, new_data.bytesize - pos)
+        delta << 0x02.chr
+        delta << [literal.bytesize].pack('N')
+        delta << literal
+      end
+      
+      # Only return if beneficial
+      delta.bytesize < new_data.bytesize * 0.8 ? delta : nil
     end
   end
 end

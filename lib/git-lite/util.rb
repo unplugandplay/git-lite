@@ -29,12 +29,15 @@ module GitLite
     def self.binary?(content)
       return false if content.nil? || content.empty?
       
+      # Force binary encoding for checking
+      content = content.dup.force_encoding(Encoding::ASCII_8BIT)
+      
       # Check for null bytes
       return true if content.include?("\x00")
       
       # Check for high ratio of non-printable chars
       sample = content[0..8000]
-      non_printable = sample.count("\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff")
+      non_printable = sample.bytes.count { |b| b < 32 && b != 9 && b != 10 && b != 13 || b >= 127 }
       
       non_printable > sample.length * 0.3
     end
