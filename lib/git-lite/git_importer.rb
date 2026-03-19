@@ -11,101 +11,64 @@ module GitLite
     def import_branch(branch = 'main')
       puts "Exporting git history..."
 
-      # Use backtick instead of Open3
       cmd = "cd '#{@git_path}' && git fast-export --reencode=yes --show-original-ids #{branch} 2>/dev/null"
-      stdout = `#{cmd}`
-
-      unless $?.success?
-        raise "Failed to export git history"
-      end
-
-      parse_fast_export(stdout)
-    end
-
-    def parse_fast_export(data)
-      lines = data.split("\n").map { |l| l + "\n" }
-      index = 0
-
       blobs = {}
-      commits = []
 
-      while index < lines.length
-        line = lines[index].chomp
-
-        case line
-        when 'blob'
-          index += 1
-          blob = parse_blob(lines, index)
-          blobs[blob[:mark]] = blob if blob[:mark]
-          index = blob[:next_index] if blob
-
-        when /^commit /
-          index += 1
-          commit = parse_commit(lines, index)
-          commits << commit if commit
-          index = commit[:next_index] if commit
-
-        when 'done'
-          break
-        else
-          index += 1
-        end
-      end
-
-      puts "Importing #{commits.length} commits..."
-
-      commits.each_with_index do |commit, i|
-        import_commit(commit, blobs)
-        @commit_count += 1
-
-        if (i + 1) % 100 == 0
-          puts "  Imported #{i + 1}/#{commits.length} commits"
-        end
-      end
+      io = IO.popen(cmd)
+      parse_fast_export_stream(io, blobs)
+      io.close
 
       @commit_count
     end
 
-    def parse_blob(lines, start_index)
-      index = start_index
-      blob = { mark: nil, data: nil, next_index: start_index }
+    def parse_fast_export_stream(io, blobs)
+      while (line = io.gets)
+        line = line.chomp
 
-      while index < lines.length
-        line = lines[index]
+        case line
+        when 'blob'
+          parse_blob_stream(io, blobs)
 
-        if line.start_with?('mark ')
-          blob[:mark] = line.chomp.sub('mark ', '').sub(':', '').to_i
-          index += 1
-        elsif line.start_with?('original-oid ')
-          blob[:original_oid] = line.chomp.sub('original-oid ', '')
-          index += 1
-        elsif line.start_with?('data ')
-          size = line.chomp.sub('data ', '').to_i
-          index += 1
+        when /^commit /
+          commit = parse_commit_stream(io)
+          if commit
+            import_commit(commit, blobs)
+            @commit_count += 1
 
-          data_parts = []
-          bytes_read = 0
-          while bytes_read < size && index < lines.length
-            line_data = lines[index]
-            data_parts << line_data
-            bytes_read += line_data.length
-            index += 1
+            if @commit_count % 100 == 0
+              puts "  Imported #{@commit_count} commits"
+            end
           end
-          blob[:data] = data_parts.join[0...size]
 
-          blob[:next_index] = index
-          return blob
-        else
-          blob[:next_index] = index
-          return blob
+        when 'done'
+          break
         end
       end
-
-      blob
     end
 
-    def parse_commit(lines, start_index)
-      index = start_index
+    def parse_blob_stream(io, blobs)
+      blob = { mark: nil, data: nil }
+
+      while (line = io.gets)
+        line = line.chomp
+
+        if line.start_with?('mark ')
+          blob[:mark] = line.sub('mark ', '').sub(':', '').to_i
+        elsif line.start_with?('original-oid ')
+          # skip
+        elsif line.start_with?('data ')
+          size = line.sub('data ', '').to_i
+          blob[:data] = size > 0 ? io.read(size) : ''
+          io.gets  # consume trailing newline
+          blobs[blob[:mark]] = blob if blob[:mark]
+          return
+        else
+          return
+        end
+      end
+    end
+
+    def parse_commit_stream(io)
       commit = {
         mark: nil,
         original_oid: nil,
@@ -117,72 +80,50 @@ module GitLite
         committer_time: nil,
         message: '',
         from: nil,
-        file_ops: [],
-        next_index: start_index
+        file_ops: []
       }
 
-      while index < lines.length
-        line = lines[index]
-        chomped = line.chomp
+      while (line = io.gets)
+        line = line.chomp
 
-        case chomped
-        when /^mark /
-          commit[:mark] = chomped.sub('mark ', '').sub(':', '').to_i
-          index += 1
+        if line.start_with?('mark ')
+          commit[:mark] = line.sub('mark ', '').sub(':', '').to_i
 
-        when /^original-oid /
-          commit[:original_oid] = chomped.sub('original-oid ', '')
-          index += 1
+        elsif line.start_with?('original-oid ')
+          commit[:original_oid] = line.sub('original-oid ', '')
 
-        when /^author /
-          commit[:author_name], commit[:author_email], commit[:author_time] = parse_author(chomped.sub('author ', ''))
-          index += 1
+        elsif line.start_with?('author ')
+          commit[:author_name], commit[:author_email], commit[:author_time] = parse_author(line.sub('author ', ''))
 
-        when /^committer /
-          commit[:committer_name], commit[:committer_email], commit[:committer_time] = parse_author(chomped.sub('committer ', ''))
-          index += 1
+        elsif line.start_with?('committer ')
+          commit[:committer_name], commit[:committer_email], commit[:committer_time] = parse_author(line.sub('committer ', ''))
 
-        when /^data /
-          size = chomped.sub('data ', '').to_i
-          index += 1
+        elsif line.start_with?('data ')
+          size = line.sub('data ', '').to_i
+          commit[:message] = size > 0 ? io.read(size) : ''
+          io.gets  # consume trailing newline
 
-          message_data = lines[index..index + 10].join[0...size]
-          commit[:message] = message_data
-          index += 1
+        elsif line.start_with?('from ')
+          commit[:from] = line.sub('from ', '').sub(':', '').to_i
 
-          remaining = size - message_data.length
-          while remaining > 0 && index < lines.length
-            remaining -= lines[index].length
-            index += 1
-          end
+        elsif line.start_with?('M ')
+          parts = line.split(' ')
+          mode = parts[1]
+          mark = parts[2].sub(':', '').to_i
+          path = parts[3..-1].join(' ')
+          commit[:file_ops] << { type: :modify, mode: mode.to_i(8), mark: mark, path: path }
 
-        when /^from /
-          commit[:from] = chomped.sub('from ', '').sub(':', '').to_i
-          index += 1
+        elsif line.start_with?('D ')
+          parts = line.split(' ')
+          path = parts[1..-1].join(' ')
+          commit[:file_ops] << { type: :delete, path: path }
 
-        when /^M /, /^D /
-          parts = chomped.split(' ')
-          if chomped.start_with?('M ')
-            mode = parts[1]
-            mark = parts[2].sub(':', '').to_i
-            path = parts[3..-1].join(' ')
-            commit[:file_ops] << { type: :modify, mode: mode.to_i(8), mark: mark, path: path }
-          else
-            path = parts[1..-1].join(' ')
-            commit[:file_ops] << { type: :delete, path: path }
-          end
-          index += 1
-
-        when ''
-          commit[:next_index] = index + 1
+        elsif line == ''
           return commit
 
-        else
-          index += 1
         end
       end
 
-      commit[:next_index] = index
       commit
     end
 

@@ -547,7 +547,7 @@ module GitLite
               packed = [final_flags].pack('C') + final_data
 
               repo.db.execute(
-                "UPDATE content SET data = ? WHERE path_id = ? AND version_id = ?",
+                "UPDATE content SET data = CAST(? AS BLOB) WHERE path_id = ? AND version_id = ?",
                 [packed, path_id, version_id]
               )
 

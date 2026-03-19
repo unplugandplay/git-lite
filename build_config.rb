@@ -2,33 +2,36 @@
 MRuby::Build.new do |conf|
   toolchain :clang
 
-  # Core gems
+  # Core gems (includes mruby-io, mruby-dir, mruby-errno, mruby-pack, etc.)
   conf.gembox 'default'
 
-  # File I/O
-  conf.gem mgem: 'mruby-io'
-  conf.gem mgem: 'mruby-dir'
-  conf.gem mgem: 'mruby-dir-glob'
-  conf.gem mgem: 'mruby-env'
-  conf.gem mgem: 'mruby-errno'
+  # Dir.glob support
+  conf.gem github: 'gromnitsky/mruby-dir-glob'
 
-  # Data formats
-  conf.gem mgem: 'mruby-json'
-  conf.gem mgem: 'mruby-pack'
+  # Environment variables
+  conf.gem github: 'iij/mruby-env'
 
-  # Crypto / Compression
-  conf.gem mgem: 'mruby-sha2'
-  conf.gem mgem: 'mruby-zlib'
+  # Regexp (Oniguruma)
+  conf.gem github: 'mattn/mruby-onig-regexp'
 
-  # Database
-  conf.gem mgem: 'mruby-sqlite3'
+  # JSON
+  conf.gem github: 'mattn/mruby-json'
+
+  # Digest (SHA256 via CommonCrypto on macOS)
+  conf.gem github: 'iij/mruby-digest'
+
+  # Zlib compression
+  conf.gem github: 'iij/mruby-zlib'
+
+  # SQLite3
+  conf.gem github: 'mattn/mruby-sqlite3'
 
   # Time formatting
-  conf.gem mgem: 'mruby-time-strftime'
+  conf.gem github: 'monochromegane/mruby-time-strftime'
 
   # Testing
-  conf.gem mgem: 'mruby-mtest'
-  conf.gem mgem: 'mruby-stringio'
+  conf.gem github: 'iij/mruby-mtest'
+  conf.gem github: 'ksss/mruby-stringio'
 
   # Enable debug for development
   conf.enable_debug

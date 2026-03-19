@@ -348,7 +348,7 @@ module GitLite
       end
 
       @wrapper.execute(
-        "INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, ?)",
+        "INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, CAST(? AS BLOB))",
         [path_id, version_id, packed]
       )
 

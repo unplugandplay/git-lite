@@ -77,7 +77,7 @@ class File
 end unless File.respond_to?(:binread)
 
 # Dir.mktmpdir replacement
-module Dir
+class Dir
   def self.mktmpdir(prefix = 'mruby')
     base = ENV['TMPDIR'] || '/tmp'
     path = "#{base}/#{prefix}-#{Time.now.to_i}-#{rand(100000)}"
@@ -170,7 +170,7 @@ module Digest
       SHA2.sha256_hex(data)
     end
   end
-end unless defined?(Digest)
+end unless Object.const_defined?(:Digest)
 
 # Enumerable#to_set replacement
 class Array

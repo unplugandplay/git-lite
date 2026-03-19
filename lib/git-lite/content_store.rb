@@ -110,7 +110,7 @@ module GitLite
     def store_keyframe(path_id, version_id, content)
       packed = pack_content(content, true)
       @db.execute(
-        "INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, ?)",
+        "INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, CAST(? AS BLOB))",
         [path_id, version_id, packed]
       )
       @db.execute(
@@ -122,7 +122,7 @@ module GitLite
     def store_delta(path_id, version_id, delta, base_version)
       packed = pack_content(delta, false)
       @db.execute(
-        "INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, ?)",
+        "INSERT OR REPLACE INTO content (path_id, version_id, data) VALUES (?, ?, CAST(? AS BLOB))",
         [path_id, version_id, packed]
       )
       @db.execute(

@@ -108,7 +108,7 @@ module GitLite
       return 0 if new_data.bytesize < sample_size
 
       samples.times do
-        pos = rand(0..new_data.bytesize - sample_size)
+        pos = rand(new_data.bytesize - sample_size + 1)
         sample = new_data[pos, sample_size]
         matches += 1 if old_data.include?(sample)
       end

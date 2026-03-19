@@ -8,7 +8,6 @@ module GitLite
     def initialize(path)
       @path = path
       @db = nil
-      @column_cache = {}
     end
 
     def connect
@@ -26,28 +25,37 @@ module GitLite
     end
 
     def execute(sql, params = [])
-      if params.empty?
-        rows = @db.execute(sql)
-      else
-        # Flatten single-element arrays for mruby-sqlite3
-        params = [params] unless params.is_a?(Array)
-        rows = @db.execute(sql, params)
-      end
+      is_query = sql.strip =~ /\A(SELECT|PRAGMA)/i
 
-      # Convert to array of hashes if SELECT query
-      return rows unless sql.strip.upcase.start_with?('SELECT') || sql.strip.upcase.start_with?('PRAGMA')
-      return [] if rows.nil? || rows.empty?
-
-      # Get column names from the query
-      columns = get_columns_for_query(sql)
-      return rows unless columns && !columns.empty?
-
-      rows.map do |row|
-        hash = {}
-        columns.each_with_index do |col, i|
-          hash[col] = row[i] if row[i] != nil || true
+      if is_query
+        if params.is_a?(Array) && params.length > 0
+          rs = @db.execute(sql, *params)
+        else
+          rs = @db.execute(sql)
         end
-        hash
+        columns = rs.fields
+        rows = collect_rows(rs)
+        rs.close
+
+        return rows if columns.nil? || columns.length == 0
+
+        rows.map do |row|
+          hash = {}
+          columns.each_with_index do |col, i|
+            hash[col] = row[i]
+          end
+          hash
+        end
+      else
+        if params.is_a?(Array) && params.length > 0
+          # Parameterized DML: splat params, drain and close ResultSet
+          rs = @db.execute(sql, *params)
+          collect_rows(rs)
+          rs.close
+        else
+          @db.execute_batch(sql)
+        end
+        nil
       end
     end
 
@@ -57,8 +65,15 @@ module GitLite
     end
 
     def get_first_value(sql, *params)
-      rows = @db.execute(sql, params.flatten)
-      return nil if rows.nil? || rows.empty?
+      flat = params.flatten
+      if flat.length > 0
+        rs = @db.execute(sql, *flat)
+      else
+        rs = @db.execute(sql)
+      end
+      rows = collect_rows(rs)
+      rs.close
+      return nil if rows.length == 0
       row = rows.first
       row.is_a?(Array) ? row.first : row
     end
@@ -86,44 +101,14 @@ module GitLite
 
     private
 
-    def get_columns_for_query(sql)
-      # Extract column names from SQL
-      # For SELECT * queries, use PRAGMA table_info
-      normalized = sql.strip.gsub(/\s+/, ' ')
-
-      if normalized =~ /SELECT\s+\*\s+FROM\s+(\w+)/i
-        table = $1
-        get_table_columns(table)
-      elsif normalized =~ /SELECT\s+(.+?)\s+FROM/i
-        cols = $1
-        parse_select_columns(cols)
-      else
-        nil
+    def collect_rows(rs)
+      rows = []
+      loop do
+        row = rs.next
+        break if row.nil?
+        rows << row
       end
-    end
-
-    def get_table_columns(table)
-      @column_cache[table] ||= begin
-        rows = @db.execute("PRAGMA table_info(#{table})")
-        rows.map { |r| r[1] }  # Column name is at index 1
-      end
-    end
-
-    def parse_select_columns(cols_str)
-      cols_str.split(',').map do |col|
-        col = col.strip
-        # Handle "expr AS alias" and "table.column"
-        if col =~ /\s+[Aa][Ss]\s+(\w+)\s*$/
-          $1
-        elsif col =~ /\.(\w+)$/
-          $1
-        elsif col =~ /^\w+$/
-          col
-        else
-          # Aggregate or complex expression - use as-is
-          col.gsub(/[^a-zA-Z0-9_]/, '_')
-        end
-      end
+      rows
     end
   end
 
