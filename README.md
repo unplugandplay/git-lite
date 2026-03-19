@@ -219,17 +219,21 @@ This branch targets **mruby 3.4+** instead of CRuby. Key differences:
 
 ## Benchmarks
 
-Importing [fzf](https://github.com/junegunn/fzf) (3,555 commits, 161 paths):
+Importing [fzf](https://github.com/junegunn/fzf) (3,554 commits, 193 paths) on mruby 3.4.0:
 
-| Metric | git `gc --aggressive` | git-lite (import + gc) |
-|--------|----------------------|------------------------|
-| Size | 4.2 MB | 21 MB |
-| Ratio | 1x | 5.0x |
+| Metric | git `gc --aggressive` | git-lite mruby (import + gc) |
+|--------|----------------------|------------------------------|
+| Size | 4.2 MB | 32 MB |
+| Ratio | 1x | 7.6x |
 
 Compression stages:
-- Raw import: 112 MB
-- After zlib: 33 MB (3.4x reduction)
-- After delta GC: 21 MB (1.5x additional reduction)
+- Raw import: 80 MB
+- After zlib: 69 MB (inline during import)
+- After delta GC: 32 MB (5,436 deltas created)
+
+Timing (Apple Silicon):
+- Import: 2 min 28 sec
+- GC (delta compression): 15 min 23 sec
 
 ## License
 
